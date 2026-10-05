@@ -4,6 +4,11 @@
 支持以当前末条为中心触发片段（前 before 条 + 中心 + 后 after 条），
 片段等后续样本到齐后完成；最近 H 条历史与所有未删除片段共同占用容量 C。
 
+会话的 H 与 C 可在不停采样的情况下同时调整：新历史窗口涉及的样本必须全部
+仍存活、未删除片段总长不超过新 C、新历史与片段已写入部分的序号并集不超过
+新 C，任一不满足则整体拒绝且不改变状态；成功后按新参数回收不再需要的样本，
+扩容不会恢复已回收的样本。
+
 可选的整数模式识别：会话可在首条样本写入前配置一次长度 1～32 的整数
 pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配（允许重叠）。
 自动机只保存标量状态，不保存原始样本、不占用样本容量，故样本回收与
@@ -29,6 +34,28 @@ class CreateSessionRequest(BaseModel):
     @model_validator(mode="after")
     def _check_h_le_c(self) -> "CreateSessionRequest":
         if self.history > self.capacity:
+            raise ValueError("必须满足 1 <= H <= C <= 1000")
+        return self
+
+
+class AdjustLimitsRequest(BaseModel):
+    history: int = Field(description="新的历史长度 H")
+    capacity: int = Field(description="新的样本容量 C")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _check_types(cls, data: object) -> object:
+        # 显式校验，确保布尔值、字符串、浮点等不会被宽松转换为整数（返回 422）
+        if not isinstance(data, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        for key in ("history", "capacity"):
+            if type(data.get(key)) is not int:
+                raise ValueError(f"{key} 必须是整数，不能为布尔值或字符串")
+        return data
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "AdjustLimitsRequest":
+        if not (1 <= self.history <= self.capacity <= 1000):
             raise ValueError("必须满足 1 <= H <= C <= 1000")
         return self
 
@@ -187,6 +214,36 @@ class Session:
 
     # ---- 操作 ----
 
+    def adjust_limits(self, history: int, capacity: int) -> None:
+        """调整 H 与 C；任一校验失败抛 409 且不改变任何状态，成功后按新参数回收。
+
+        校验（全部通过才应用）：
+        - 最近 min(新H, 已写入条数) 条必须全部仍存活（扩容不恢复已回收样本）；
+        - 任一未删除片段的总长（before+1+after）不得超过新 C；
+        - 新历史窗口与所有未删除片段已写入部分的序号并集不得超过新 C。
+        旧片段的 before 允许大于等于新 H，仅后续触发按新参数校验。
+        """
+        written = self.next_seq - 1
+        window = min(history, written)
+        lo = written - window + 1  # 新历史窗口首序号；window 为 0 时范围为空
+        if any(seq not in self.samples for seq in range(lo, written + 1)):
+            raise _conflict("新历史窗口包含已回收的样本，无法应用新的历史长度")
+        for frag in self.fragments.values():
+            if frag.before + 1 + frag.after > capacity:
+                raise _conflict(
+                    f"片段 {frag.fragment_id} 的总长超过新容量 C={capacity}"
+                )
+        needed = set(range(lo, written + 1))
+        for frag in self.fragments.values():
+            hi = min(frag.end, written)
+            if frag.start <= hi:
+                needed.update(range(frag.start, hi + 1))
+        if len(needed) > capacity:
+            raise _conflict("新历史与未删除片段已写入部分的序号并集超过新容量")
+        self.history = history
+        self.capacity = capacity
+        self.reclaim()
+
     def write(self, value: int) -> int:
         """写入一条样本；容量不足时抛 409，不消耗序号、不改变历史或片段。
 
@@ -247,6 +304,18 @@ def _get_session(session_id: int) -> Session:
     return sess
 
 
+def _session_summary(sess: Session) -> dict:
+    return {
+        "session_id": sess.session_id,
+        "history": sess.history,
+        "capacity": sess.capacity,
+        "next_seq": sess.next_seq,
+        "used": len(sess.samples),
+        "stored_seqs": sorted(sess.samples),
+        "fragments": sorted(sess.fragments),
+    }
+
+
 def _fragment_summary(sess: Session, frag: Fragment) -> dict:
     return {
         "fragment_id": frag.fragment_id,
@@ -291,15 +360,15 @@ async def create_session(req: CreateSessionRequest) -> dict:
 async def get_session(session_id: int) -> dict:
     sess = _get_session(session_id)
     async with sess.lock:
-        return {
-            "session_id": sess.session_id,
-            "history": sess.history,
-            "capacity": sess.capacity,
-            "next_seq": sess.next_seq,
-            "used": len(sess.samples),
-            "stored_seqs": sorted(sess.samples),
-            "fragments": sorted(sess.fragments),
-        }
+        return _session_summary(sess)
+
+
+@app.put("/sessions/{session_id}/limits")
+async def adjust_limits(session_id: int, req: AdjustLimitsRequest) -> dict:
+    sess = _get_session(session_id)
+    async with sess.lock:
+        sess.adjust_limits(req.history, req.capacity)
+        return _session_summary(sess)
 
 
 @app.post("/sessions/{session_id}/samples", status_code=201)

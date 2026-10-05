@@ -12,6 +12,13 @@
   同一序号只计一次（并集）；仅回收两者都不再需要的样本。
   新样本无处容纳时写入返回 `409`，**不消耗序号、不改变历史或片段**。
 - 删除片段只解除该片段的引用，回收后写入可重试；已完成片段在删除前内容不变。
+- **调整 H 与 C**：会话可在不停采样的情况下同时提交新的 `history` 与 `capacity`
+  （`1 ≤ H ≤ C ≤ 1000`，须为整数，布尔值/字符串等返回 `422`）。
+  最近 `min(H, 已写入条数)` 条必须全部仍存活、所有未删除片段总长不超过新 `C`、
+  且新历史窗口与片段已写入部分的序号并集不超过新 `C`，任一不满足返回 `409` 且**不改变任何状态**；
+  成功后按新参数回收不再需要的样本（**扩容不会恢复已回收样本**），返回格式同查询会话。
+  旧片段的 `before` 允许大于等于新 `H`，仅后续触发按新参数校验；
+  片段及其内容、下一样本/片段编号、模式配置、匹配进度与命中记录均不变。
 - 会话内所有操作按会话级锁串行执行，等效于某个串行顺序。
 - **整数模式识别（可选）**：会话可在**首条样本写入前**配置一次长度 `1～32` 的整数
   pattern，此后按成功写入的连续样本值精确匹配，**允许重叠**（pattern 可以长于 `H` 和 `C`）。
@@ -43,6 +50,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | --- | --- | --- |
 | POST | `/sessions` | 创建会话，指定 `history`(H)、`capacity`(C) |
 | GET | `/sessions/{sid}` | 查看会话状态（已用容量、存活序号、片段列表） |
+| PUT | `/sessions/{sid}/limits` | 同时调整会话的 `history`(H) 与 `capacity`(C)，返回格式同查询会话 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
@@ -52,8 +60,10 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | DELETE | `/sessions/{sid}/fragments/{fid}` | 删除片段（解除引用并回收样本） |
 
 错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
-查询未配置 pattern 的会话；`400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；
-`422` 请求体不合法（含 pattern 长度非法、元素为布尔值或字符串）。
+查询未配置 pattern 的会话、调整参数与现有样本/片段冲突；
+`400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；
+`422` 请求体不合法（含 pattern 长度非法、元素为布尔值或字符串，以及调整参数为
+布尔值/非整数、缺字段或不满足 `1 ≤ H ≤ C ≤ 1000`）。
 
 ## 调用示例
 
@@ -214,6 +224,94 @@ curl -s -X DELETE http://localhost:8000/sessions/3/fragments/1 -o /dev/null -w '
 curl -s -X POST http://localhost:8000/sessions/3/samples \
   -H 'Content-Type: application/json' -d '{"value": 1}'
 # {"seq":5,"value":1}
+```
+
+### 10. 调整 H 与 C：成功收缩
+
+会话 4 创建时 `H=3, C=5`，写入 5 条后历史窗口只保留最近 3 条（序号 3–5）。
+收缩为 `H=2, C=3`：新窗口需要的序号 4–5 全部存活、无未删除片段、并集大小 2 ≤ 3，
+调整成功并按新参数立即回收序号 3；返回格式同查询会话：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 3, "capacity": 5}'
+# {"session_id":4,"history":3,"capacity":5}
+
+for v in 10 20 30 40 50; do
+  curl -s -X POST http://localhost:8000/sessions/4/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+
+curl -s http://localhost:8000/sessions/4
+# {"session_id":4,"history":3,"capacity":5,"next_seq":6,"used":3,"stored_seqs":[3,4,5],"fragments":[]}
+
+curl -s -X PUT http://localhost:8000/sessions/4/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":4,"history":2,"capacity":3,"next_seq":6,"used":2,"stored_seqs":[4,5],"fragments":[]}
+```
+
+### 11. 调整 H 与 C：扩大历史失败（409，状态不变）
+
+会话 4 的序号 2、3 早已被回收，把 `H` 扩大为 4 需要最近 4 条（序号 2–5）全部存活，
+校验失败返回 `409`，且历史、容量、存活样本均保持原值：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/4/limits \
+  -H 'Content-Type: application/json' -d '{"history": 4, "capacity": 5}'
+# 409   —— 新历史窗口包含已回收的样本，拒绝且不改变任何状态
+
+curl -s http://localhost:8000/sessions/4
+# {"session_id":4,"history":2,"capacity":3,"next_seq":6,"used":2,"stored_seqs":[4,5],"fragments":[]}
+```
+
+布尔值、字符串等非整数，缺字段，或不满足 `1 ≤ H ≤ C ≤ 1000` 均返回 `422`；
+未知会话返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/4/limits \
+  -H 'Content-Type: application/json' -d '{"history": true, "capacity": 3}'
+# 422
+
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/4/limits \
+  -H 'Content-Type: application/json' -d '{"history": 4, "capacity": 3}'
+# 422   —— H > C
+
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/999/limits \
+  -H 'Content-Type: application/json' -d '{"history": 1, "capacity": 1}'
+# 404
+```
+
+### 12. 调整 H 与 C：扩容后重试写入
+
+会话 5（`H=2, C=3`）中片段 1 引用序号 2–4，历史窗口需要 3–4，并集占满 `C=3`，
+写入第 5 条返回 `409`；把 `C` 扩容为 4 后重试成功，序号保持连续。
+注意序号 1 早已被回收，扩容不会将其恢复：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# {"session_id":5,"history":2,"capacity":3}
+
+for v in 10 20 30; do
+  curl -s -X POST http://localhost:8000/sessions/5/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+curl -s -X POST http://localhost:8000/sessions/5/triggers \
+  -H 'Content-Type: application/json' -d '{"before": 1, "after": 1}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/5/samples \
+  -H 'Content-Type: application/json' -d '{"value": 40}' > /dev/null   # seq=4，片段完成
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/5/samples \
+  -H 'Content-Type: application/json' -d '{"value": 50}'
+# 409   —— 需要 {2,3,4,5} 共 4 个位置，超出 C=3，序号未消耗
+
+curl -s -X PUT http://localhost:8000/sessions/5/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":5,"history":2,"capacity":4,"next_seq":5,"used":3,"stored_seqs":[2,3,4],"fragments":[1]}
+
+curl -s -X POST http://localhost:8000/sessions/5/samples \
+  -H 'Content-Type: application/json' -d '{"value": 50}'
+# {"seq":5,"value":50}   —— 扩容后重试成功，序号连续
 ```
 
 ## 本地开发（可选）
