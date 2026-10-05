@@ -3,6 +3,8 @@
 单进程内存态的 HTTP 服务：按会话维护连续编号的整数样本，
 支持以当前末条为中心触发片段（前 before 条 + 中心 + 后 after 条），
 片段等后续样本到齐后完成；最近 H 条历史与所有未删除片段共同占用容量 C。
+会话运行中可不停采样地调整 H 与 C：校验通过才生效并按新参数回收，
+任一校验失败则拒绝且不改变任何状态。
 
 可选的整数模式识别：会话可在首条样本写入前配置一次长度 1～32 的整数
 pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配（允许重叠）。
@@ -29,6 +31,28 @@ class CreateSessionRequest(BaseModel):
     @model_validator(mode="after")
     def _check_h_le_c(self) -> "CreateSessionRequest":
         if self.history > self.capacity:
+            raise ValueError("必须满足 1 <= H <= C <= 1000")
+        return self
+
+
+class UpdateLimitsRequest(BaseModel):
+    history: int = Field(description="新的历史长度 H")
+    capacity: int = Field(description="新的样本容量 C")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _check_types(cls, data: object) -> object:
+        # 显式校验，确保布尔值、字符串、浮点等不会被宽松转换为整数（返回 422）
+        if not isinstance(data, dict):
+            raise ValueError("请求体必须是包含 history 和 capacity 的对象")
+        for key in ("history", "capacity"):
+            if key not in data or type(data[key]) is not int:
+                raise ValueError("history 和 capacity 必须是整数，不能为布尔值或字符串")
+        return data
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "UpdateLimitsRequest":
+        if not (1 <= self.history <= self.capacity <= 1000):
             raise ValueError("必须满足 1 <= H <= C <= 1000")
         return self
 
@@ -144,13 +168,15 @@ class Session:
 
     # ---- 容量核算 ----
 
-    def needed_seqs(self, upto: int) -> set[int]:
+    def needed_seqs(self, upto: int, history: int | None = None) -> set[int]:
         """假设已写入 upto 条时，历史窗口与所有未删除片段共同需要的序号集合。
 
+        history 缺省为当前 H；显式传入时按该长度核算（用于调整参数的预检）。
         同序号只计一次（集合语义）；片段只统计已写入的部分，
         未写入的后续样本在将来写入时再参与核算。
         """
-        lo = max(1, upto - self.history + 1)
+        h = self.history if history is None else history
+        lo = max(1, upto - h + 1)
         needed = set(range(lo, upto + 1))
         for frag in self.fragments.values():
             hi = min(frag.end, upto)
@@ -164,6 +190,30 @@ class Session:
         for seq in list(self.samples):
             if seq not in live:
                 del self.samples[seq]
+
+    # ---- 运行中调整 H / C ----
+
+    def adjust_limits(self, history: int, capacity: int) -> None:
+        """不停采样地调整 H 与 C；任一校验失败抛 409 且不改变任何状态。
+
+        全部通过后按新参数回收不再需要的样本。片段及其内容、样本与片段
+        编号、模式配置与命中记录均不受影响；扩容不会恢复已回收的样本，
+        旧片段的 before 即使不小于新 H 也原样保留（仅约束后续触发）。
+        """
+        upto = self.next_seq - 1
+        # 新历史窗口要求的最近 min(H, 已写入条数) 条必须全部仍存活
+        lo = max(1, upto - history + 1)
+        if any(seq not in self.samples for seq in range(lo, upto + 1)):
+            raise _conflict("新历史窗口包含已回收的样本，无法调整")
+        # 未删除片段的总长不能超过新容量
+        if any(f.before + 1 + f.after > capacity for f in self.fragments.values()):
+            raise _conflict("存在总长超过新容量的未删除片段，无法调整")
+        # 新历史窗口与片段已写入部分的序号并集不能超过新容量
+        if len(self.needed_seqs(upto, history)) > capacity:
+            raise _conflict("新历史与未删除片段所需序号的并集超过新容量，无法调整")
+        self.history = history
+        self.capacity = capacity
+        self.reclaim()
 
     # ---- 模式识别 ----
 
@@ -247,6 +297,18 @@ def _get_session(session_id: int) -> Session:
     return sess
 
 
+def _session_summary(sess: Session) -> dict:
+    return {
+        "session_id": sess.session_id,
+        "history": sess.history,
+        "capacity": sess.capacity,
+        "next_seq": sess.next_seq,
+        "used": len(sess.samples),
+        "stored_seqs": sorted(sess.samples),
+        "fragments": sorted(sess.fragments),
+    }
+
+
 def _fragment_summary(sess: Session, frag: Fragment) -> dict:
     return {
         "fragment_id": frag.fragment_id,
@@ -291,15 +353,15 @@ async def create_session(req: CreateSessionRequest) -> dict:
 async def get_session(session_id: int) -> dict:
     sess = _get_session(session_id)
     async with sess.lock:
-        return {
-            "session_id": sess.session_id,
-            "history": sess.history,
-            "capacity": sess.capacity,
-            "next_seq": sess.next_seq,
-            "used": len(sess.samples),
-            "stored_seqs": sorted(sess.samples),
-            "fragments": sorted(sess.fragments),
-        }
+        return _session_summary(sess)
+
+
+@app.put("/sessions/{session_id}/limits")
+async def update_limits(session_id: int, req: UpdateLimitsRequest) -> dict:
+    sess = _get_session(session_id)
+    async with sess.lock:
+        sess.adjust_limits(req.history, req.capacity)
+        return _session_summary(sess)
 
 
 @app.post("/sessions/{session_id}/samples", status_code=201)
